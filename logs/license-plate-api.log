@@ -1,0 +1,14 @@
+2025-09-20 21:07:18.196 [main] INFO  c.e.l.LicensePlateApiApplication - Starting LicensePlateApiApplication using Java 21.0.6 with PID 25044 (E:\ATENTUS\java\license-plate-api\src\target\classes started by jorge in E:\ATENTUS\java\license-plate-api)
+2025-09-20 21:07:18.198 [main] DEBUG c.e.l.LicensePlateApiApplication - Running with Spring Boot v3.2.0, Spring v6.1.1
+2025-09-20 21:07:18.200 [main] INFO  c.e.l.LicensePlateApiApplication - No active profile set, falling back to 1 default profile: "default"
+2025-09-20 21:07:21.690 [main] INFO  o.s.b.w.e.tomcat.TomcatWebServer - Tomcat initialized with port 8080 (http)
+2025-09-20 21:07:21.712 [main] INFO  o.a.catalina.core.StandardService - Starting service [Tomcat]
+2025-09-20 21:07:21.713 [main] INFO  o.a.catalina.core.StandardEngine - Starting Servlet engine: [Apache Tomcat/10.1.16]
+2025-09-20 21:07:21.862 [main] INFO  o.a.c.c.C.[.[localhost].[/api] - Initializing Spring embedded WebApplicationContext
+2025-09-20 21:07:21.863 [main] INFO  o.s.b.w.s.c.ServletWebServerApplicationContext - Root WebApplicationContext: initialization completed in 3514 ms
+2025-09-20 21:07:23.392 [main] INFO  o.s.b.a.e.web.EndpointLinksResolver - Exposing 4 endpoint(s) beneath base path '/actuator'
+2025-09-20 21:07:23.540 [main] INFO  o.s.b.w.e.tomcat.TomcatWebServer - Tomcat started on port 8080 (http) with context path '/api'
+2025-09-20 21:07:23.573 [main] INFO  c.e.l.LicensePlateApiApplication - Started LicensePlateApiApplication in 6.534 seconds (process running for 7.789)
+2025-09-20 21:07:52.438 [http-nio-8080-exec-1] INFO  o.a.c.c.C.[.[localhost].[/api] - Initializing Spring DispatcherServlet 'dispatcherServlet'
+2025-09-20 21:07:52.439 [http-nio-8080-exec-1] INFO  o.s.web.servlet.DispatcherServlet - Initializing Servlet 'dispatcherServlet'
+2025-09-20 21:07:52.442 [http-nio-8080-exec-1] INFO  o.s.web.servlet.DispatcherServlet - Completed initialization in 3 ms

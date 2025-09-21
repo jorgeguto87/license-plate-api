@@ -1,8 +1,8 @@
 package com.example.licenseplate.service;
 
+import com.example.licenseplate.service.ImageSaveService;
 import com.example.licenseplate.dto.ProcessingResult;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
@@ -26,235 +26,482 @@ public class ImageProcessorService {
     @Autowired
     private LicensePlateDetector plateDetector;
 
-    @Value("${image.compression.quality:0.8}")
-    private double compressionQuality;
-
-    @Value("${image.max.width:1920}")
-    private int maxWidth;
-
-    @Value("${image.max.height:1080}")
-    private int maxHeight;
+    @Autowired
+    private ImageSaveService imageSaveService;
 
     private final ConcurrentHashMap<String, ProcessingResult> processingCache = new ConcurrentHashMap<>();
+
+    // Configurações otimizadas para processamento
+    private static final float COMPRESSION_QUALITY = 0.85f;
+    private static final int BLUR_INTENSITY = 12;
+    private static final int PIXELATION_SIZE = 8;
+
+    // Timeout para processamento (30 segundos)
+    private static final long PROCESSING_TIMEOUT_MS = 30000;
 
     @Async
     public CompletableFuture<ProcessingResult> processImageAsync(String processId, byte[] imageData) {
         long startTime = System.currentTimeMillis();
+        System.out.println("[IMAGE-PROCESSOR] Iniciando processamento inteligente para ID: " + processId);
+        System.out.println("[IMAGE-PROCESSOR] Tamanho da imagem: " + imageData.length + " bytes");
 
         try {
-            // Atualizar status para processando
-            processingCache.put(processId, ProcessingResult.processing(processId));
+            // Status inicial PROCESSING no cache
+            ProcessingResult processingStatus = ProcessingResult.processing(processId);
+            processingCache.put(processId, processingStatus);
+            System.out.println("[IMAGE-PROCESSOR] Status PROCESSING salvo no cache para " + processId);
 
-            // Detectar placa
-            LicensePlateDetector.PlateDetectionResult detection = plateDetector.detectPlate(imageData);
-
-            // Processar imagem
-            byte[] processedImage;
-            ProcessingResult result;
-
-            if (detection.isFound()) {
-                // Aplicar blur na placa e comprimir
-                processedImage = blurPlateAndCompress(imageData, detection.getCoordinates());
-
-                ProcessingResult.PlateCoordinates coords = new ProcessingResult.PlateCoordinates(
-                        detection.getCoordinates().x,
-                        detection.getCoordinates().y,
-                        detection.getCoordinates().width,
-                        detection.getCoordinates().height
-                );
-
-                result = ProcessingResult.completedWithPlate(
-                        processId,
-                        detection.getPlateText(),
-                        detection.getFormat(),
-                        coords,
-                        Base64.getEncoder().encodeToString(processedImage)
-                );
-            } else {
-                // Apenas comprimir a imagem
-                processedImage = compressImage(imageData);
-                result = ProcessingResult.completed(
-                        processId,
-                        Base64.getEncoder().encodeToString(processedImage)
-                );
+            // Validação e carregamento da imagem
+            BufferedImage originalImage = validateAndLoadImage(imageData);
+            if (originalImage == null) {
+                ProcessingResult errorResult = ProcessingResult.error(processId, "Imagem inválida ou corrompida");
+                processingCache.put(processId, errorResult);
+                return CompletableFuture.completedFuture(errorResult);
             }
+
+            System.out.println("[IMAGE-PROCESSOR] Imagem válida: " + originalImage.getWidth() + "x" + originalImage.getHeight());
+
+            // Salvar imagem original se habilitado
+            saveOriginalImageIfEnabled(processId, imageData);
+
+            // Detecção inteligente de placa com timeout
+            System.out.println("[IMAGE-PROCESSOR] Iniciando detecção inteligente...");
+            LicensePlateDetector.PlateDetectionResult detection = performDetectionWithTimeout(imageData, startTime);
+
+            ProcessingResult result = processDetectionResult(processId, originalImage, detection);
 
             long processingTime = System.currentTimeMillis() - startTime;
             result.setProcessingTimeMs(processingTime);
 
-            // Armazenar resultado
+            // Salvar resultado final no cache
             processingCache.put(processId, result);
+            System.out.println("[IMAGE-PROCESSOR] Processamento concluído em " + processingTime + "ms - Status: " + result.getStatus());
 
             return CompletableFuture.completedFuture(result);
 
         } catch (Exception e) {
-            ProcessingResult errorResult = ProcessingResult.error(processId, e.getMessage());
+            System.err.println("[IMAGE-PROCESSOR] ERRO no processamento " + processId + ": " + e.getMessage());
+            e.printStackTrace();
+
+            ProcessingResult errorResult = ProcessingResult.error(processId, "Erro interno: " + e.getMessage());
             processingCache.put(processId, errorResult);
             return CompletableFuture.completedFuture(errorResult);
         }
     }
 
-    public ProcessingResult getProcessingStatus(String processId) {
-        return processingCache.get(processId);
+    private LicensePlateDetector.PlateDetectionResult performDetectionWithTimeout(byte[] imageData, long startTime) {
+        try {
+            // Verificar timeout antes de iniciar
+            if (System.currentTimeMillis() - startTime > PROCESSING_TIMEOUT_MS) {
+                System.err.println("[IMAGE-PROCESSOR] Timeout antes da detecção");
+                return new LicensePlateDetector.PlateDetectionResult(false, null, null, null);
+            }
+
+            return plateDetector.detectPlate(imageData);
+
+        } catch (Exception e) {
+            System.err.println("[IMAGE-PROCESSOR] Erro na detecção: " + e.getMessage());
+            return new LicensePlateDetector.PlateDetectionResult(false, null, null, null);
+        }
     }
 
-    public void clearProcessingResult(String processId) {
-        processingCache.remove(processId);
+    private BufferedImage validateAndLoadImage(byte[] imageData) {
+        try {
+            BufferedImage image = ImageIO.read(new ByteArrayInputStream(imageData));
+            if (image == null) {
+                System.err.println("[IMAGE-PROCESSOR] Erro: Imagem não pôde ser decodificada");
+                return null;
+            }
+
+            // Validações básicas
+            if (image.getWidth() < 100 || image.getHeight() < 100) {
+                System.err.println("[IMAGE-PROCESSOR] Erro: Imagem muito pequena (" +
+                        image.getWidth() + "x" + image.getHeight() + ")");
+                return null;
+            }
+
+            if (image.getWidth() > 4000 || image.getHeight() > 4000) {
+                System.out.println("[IMAGE-PROCESSOR] Imagem muito grande, redimensionando...");
+                return resizeImageIntelligent(image, 2000, 2000);
+            }
+
+            return image;
+
+        } catch (Exception e) {
+            System.err.println("[IMAGE-PROCESSOR] Erro ao validar imagem: " + e.getMessage());
+            return null;
+        }
     }
 
-    private byte[] blurPlateAndCompress(byte[] imageData, Rectangle plateRegion) throws IOException {
-        // Converter byte array para BufferedImage
-        BufferedImage image = ImageIO.read(new ByteArrayInputStream(imageData));
+    private BufferedImage resizeImageIntelligent(BufferedImage image, int maxWidth, int maxHeight) {
+        int originalWidth = image.getWidth();
+        int originalHeight = image.getHeight();
 
-        if (image == null) {
-            throw new IOException("Não foi possível decodificar a imagem");
-        }
+        // Calcular nova dimensão mantendo proporção
+        double scaleW = (double) maxWidth / originalWidth;
+        double scaleH = (double) maxHeight / originalHeight;
+        double scale = Math.min(scaleW, scaleH);
 
-        // Redimensionar se necessário
-        BufferedImage resizedImage = resizeImageIfNeeded(image);
-
-        // Ajustar coordenadas da placa para a nova escala
-        Rectangle adjustedPlateRegion = adjustRectForResize(plateRegion, image, resizedImage);
-
-        // Garantir que a região está dentro dos limites da imagem
-        adjustedPlateRegion = constrainRectToBounds(adjustedPlateRegion, resizedImage);
-
-        // Aplicar blur gaussiano na região da placa
-        if (adjustedPlateRegion.width > 0 && adjustedPlateRegion.height > 0) {
-            applyGaussianBlur(resizedImage, adjustedPlateRegion);
-        }
-
-        // Comprimir e retornar
-        return compressBufferedImage(resizedImage);
-    }
-
-    private byte[] compressImage(byte[] imageData) throws IOException {
-        BufferedImage image = ImageIO.read(new ByteArrayInputStream(imageData));
-
-        if (image == null) {
-            throw new IOException("Não foi possível decodificar a imagem");
-        }
-
-        BufferedImage resizedImage = resizeImageIfNeeded(image);
-        return compressBufferedImage(resizedImage);
-    }
-
-    private BufferedImage resizeImageIfNeeded(BufferedImage image) {
-        int currentWidth = image.getWidth();
-        int currentHeight = image.getHeight();
-
-        if (currentWidth <= maxWidth && currentHeight <= maxHeight) {
-            return image; // Não precisa redimensionar
-        }
-
-        // Calcular nova escala mantendo proporção
-        double scaleX = (double) maxWidth / currentWidth;
-        double scaleY = (double) maxHeight / currentHeight;
-        double scale = Math.min(scaleX, scaleY);
-
-        int newWidth = (int) (currentWidth * scale);
-        int newHeight = (int) (currentHeight * scale);
+        int newWidth = (int) (originalWidth * scale);
+        int newHeight = (int) (originalHeight * scale);
 
         BufferedImage resized = new BufferedImage(newWidth, newHeight, BufferedImage.TYPE_INT_RGB);
         Graphics2D g2d = resized.createGraphics();
-        g2d.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+
+        // Configurações de alta qualidade
+        g2d.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
         g2d.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+        g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+
         g2d.drawImage(image, 0, 0, newWidth, newHeight, null);
         g2d.dispose();
+
+        System.out.println("[IMAGE-PROCESSOR] Imagem redimensionada de " + originalWidth + "x" + originalHeight +
+                " para " + newWidth + "x" + newHeight);
 
         return resized;
     }
 
-    private Rectangle adjustRectForResize(Rectangle originalRect, BufferedImage originalImage, BufferedImage newImage) {
-        double scaleX = (double) newImage.getWidth() / originalImage.getWidth();
-        double scaleY = (double) newImage.getHeight() / originalImage.getHeight();
+    private void saveOriginalImageIfEnabled(String processId, byte[] imageData) {
+        try {
+            if (imageSaveService != null && imageSaveService.isSaveEnabled()) {
+                String originalPath = imageSaveService.saveOriginalImage(processId, imageData);
+                if (originalPath != null) {
+                    System.out.println("[IMAGE-PROCESSOR] Imagem original salva: " + originalPath);
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("[IMAGE-PROCESSOR] Erro ao salvar imagem original: " + e.getMessage());
+        }
+    }
 
-        int newX = (int) (originalRect.x * scaleX);
-        int newY = (int) (originalRect.y * scaleY);
-        int newWidth = (int) (originalRect.width * scaleX);
-        int newHeight = (int) (originalRect.height * scaleY);
+    private ProcessingResult processDetectionResult(String processId, BufferedImage originalImage,
+                                                    LicensePlateDetector.PlateDetectionResult detection) throws IOException {
+
+        if (detection.isFound()) {
+            return processWithPlateDetected(processId, originalImage, detection);
+        } else {
+            return processWithoutPlate(processId, originalImage);
+        }
+    }
+
+    private ProcessingResult processWithPlateDetected(String processId, BufferedImage originalImage,
+                                                      LicensePlateDetector.PlateDetectionResult detection) throws IOException {
+
+        System.out.println("[IMAGE-PROCESSOR] Placa detectada: " + detection.getPlateText() + " (" + detection.getFormat() + ")");
+        System.out.println("[IMAGE-PROCESSOR] Coordenadas: " + detection.getCoordinates());
+
+        // Aplicar blur inteligente e comprimir
+        byte[] processedImageBytes = applyIntelligentBlurAndCompress(originalImage, detection.getCoordinates());
+        String base64Image = Base64.getEncoder().encodeToString(processedImageBytes);
+
+        System.out.println("[IMAGE-PROCESSOR] Blur aplicado. Tamanho final: " + processedImageBytes.length + " bytes");
+
+        // Salvar imagem processada
+        saveProcessedImageIfEnabled(processId, base64Image, detection.getPlateText());
+
+        // Criar coordenadas do resultado
+        ProcessingResult.PlateCoordinates coords = new ProcessingResult.PlateCoordinates(
+                detection.getCoordinates().x,
+                detection.getCoordinates().y,
+                detection.getCoordinates().width,
+                detection.getCoordinates().height
+        );
+
+        return ProcessingResult.completedWithPlate(
+                processId,
+                detection.getPlateText(),
+                detection.getFormat(),
+                coords,
+                base64Image
+        );
+    }
+
+    private ProcessingResult processWithoutPlate(String processId, BufferedImage originalImage) throws IOException {
+        System.out.println("[IMAGE-PROCESSOR] Nenhuma placa detectada");
+
+        // Apenas comprimir a imagem
+        byte[] compressedBytes = compressImageOptimized(originalImage);
+        String base64Image = Base64.getEncoder().encodeToString(compressedBytes);
+
+        System.out.println("[IMAGE-PROCESSOR] Imagem comprimida. Tamanho: " + compressedBytes.length + " bytes");
+
+        // Salvar imagem comprimida
+        saveProcessedImageIfEnabled(processId, base64Image, null);
+
+        return ProcessingResult.completed(processId, base64Image);
+    }
+
+    private void saveProcessedImageIfEnabled(String processId, String base64Image, String plateText) {
+        if (imageSaveService != null && imageSaveService.isSaveEnabled()) {
+            try {
+                String processedPath = imageSaveService.saveProcessedImage(processId, base64Image, plateText);
+                if (processedPath != null) {
+                    System.out.println("[IMAGE-PROCESSOR] Imagem processada salva em: " + processedPath);
+                }
+            } catch (Exception e) {
+                System.err.println("[IMAGE-PROCESSOR] Erro ao salvar imagem processada: " + e.getMessage());
+            }
+        }
+    }
+
+    private byte[] applyIntelligentBlurAndCompress(BufferedImage image, Rectangle plateRegion) throws IOException {
+        System.out.println("[IMAGE-PROCESSOR] Aplicando blur inteligente na região: " + plateRegion);
+
+        // Validar e ajustar região da placa
+        Rectangle adjustedRegion = validateAndAdjustPlateRegion(plateRegion, image.getWidth(), image.getHeight());
+        System.out.println("[IMAGE-PROCESSOR] Região ajustada: " + adjustedRegion);
+
+        // Criar cópia da imagem para processamento
+        BufferedImage processedImage = createImageCopy(image);
+
+        // Aplicar blur sofisticado
+        applyAdvancedBlur(processedImage, adjustedRegion);
+
+        // Adicionar indicador visual
+        addPrivacyIndicator(processedImage, adjustedRegion);
+
+        return compressImageOptimized(processedImage);
+    }
+
+    private Rectangle validateAndAdjustPlateRegion(Rectangle plateRegion, int imageWidth, int imageHeight) {
+        if (plateRegion == null || isInvalidRegion(plateRegion, imageWidth, imageHeight)) {
+            System.out.println("[IMAGE-PROCESSOR] Região inválida, criando estimativa inteligente");
+            return createIntelligentPlateEstimate(imageWidth, imageHeight);
+        }
+
+        // Expandir região ligeiramente para garantir cobertura completa
+        return expandRegionSafely(plateRegion, imageWidth, imageHeight);
+    }
+
+    private boolean isInvalidRegion(Rectangle region, int imageWidth, int imageHeight) {
+        return region.x < 0 || region.y < 0 ||
+                region.width <= 0 || region.height <= 0 ||
+                region.x + region.width > imageWidth ||
+                region.y + region.height > imageHeight ||
+                region.width > imageWidth * 0.8 ||
+                region.height > imageHeight * 0.4;
+    }
+
+    private Rectangle createIntelligentPlateEstimate(int imageWidth, int imageHeight) {
+        // Estimativa baseada em padrões típicos de placas em fotos
+        int estimatedWidth = Math.min(imageWidth / 3, Math.max(150, imageWidth / 4));
+        int estimatedHeight = Math.max(50, estimatedWidth / 3); // Proporção típica de placa
+
+        // Posicionar na região inferior-central (onde placas geralmente aparecem)
+        int estimatedX = (imageWidth - estimatedWidth) / 2;
+        int estimatedY = (int) (imageHeight * 0.75);
+
+        // Ajustar se sair dos limites
+        if (estimatedY + estimatedHeight > imageHeight) {
+            estimatedY = Math.max(0, imageHeight - estimatedHeight - 20);
+        }
+
+        Rectangle estimate = new Rectangle(estimatedX, estimatedY, estimatedWidth, estimatedHeight);
+        System.out.println("[IMAGE-PROCESSOR] Estimativa criada: " + estimate);
+
+        return estimate;
+    }
+
+    private Rectangle expandRegionSafely(Rectangle region, int imageWidth, int imageHeight) {
+        // Expansão de 15% para garantir cobertura total da placa (aumentado de 10% para 15%)
+        int expandX = Math.max(8, region.width / 7); // Aumentado
+        int expandY = Math.max(5, region.height / 6); // Aumentado
+
+        int newX = Math.max(0, region.x - expandX);
+        int newY = Math.max(0, region.y - expandY);
+        int newWidth = Math.min(imageWidth - newX, region.width + (expandX * 2));
+        int newHeight = Math.min(imageHeight - newY, region.height + (expandY * 2));
 
         return new Rectangle(newX, newY, newWidth, newHeight);
     }
 
-    private Rectangle constrainRectToBounds(Rectangle rect, BufferedImage image) {
-        int x = Math.max(0, Math.min(rect.x, image.getWidth() - 1));
-        int y = Math.max(0, Math.min(rect.y, image.getHeight() - 1));
-        int width = Math.min(rect.width, image.getWidth() - x);
-        int height = Math.min(rect.height, image.getHeight() - y);
+    private BufferedImage createImageCopy(BufferedImage original) {
+        BufferedImage copy = new BufferedImage(original.getWidth(), original.getHeight(), BufferedImage.TYPE_INT_RGB);
+        Graphics2D g2d = copy.createGraphics();
+        g2d.drawImage(original, 0, 0, null);
+        g2d.dispose();
+        return copy;
+    }
 
-        return new Rectangle(x, y, Math.max(1, width), Math.max(1, height));
+    private void applyAdvancedBlur(BufferedImage image, Rectangle region) {
+        System.out.println("[IMAGE-PROCESSOR] Aplicando blur avançado...");
+
+        // Blur gaussiano suave seguido de pixelização
+        applyGaussianBlur(image, region);
+        applyPixelationEffect(image, region);
     }
 
     private void applyGaussianBlur(BufferedImage image, Rectangle region) {
-        try {
-            // Implementação simples de blur usando convolução
-            int blurRadius = 15;
+        // Implementação simples de blur gaussiano
+        int radius = Math.max(4, Math.min(region.width / 18, region.height / 7)); // Aumentado ligeiramente
 
-            // Criar uma cópia da região para aplicar o blur
-            BufferedImage regionCopy = new BufferedImage(region.width, region.height, BufferedImage.TYPE_INT_RGB);
-            Graphics2D g2d = regionCopy.createGraphics();
-            g2d.drawImage(image, 0, 0, region.width, region.height,
-                    region.x, region.y, region.x + region.width, region.y + region.height, null);
-            g2d.dispose();
+        // Criar kernel gaussiano
+        float[] kernel = createGaussianKernel(radius);
 
-            // Aplicar blur simples (box blur aproximando gaussian)
-            BufferedImage blurred = applyBoxBlur(regionCopy, blurRadius);
-
-            // Copiar a região blurrada de volta para a imagem original
-            Graphics2D originalG2d = image.createGraphics();
-            originalG2d.drawImage(blurred, region.x, region.y, null);
-            originalG2d.dispose();
-
-        } catch (Exception e) {
-            System.err.println("Erro ao aplicar blur: " + e.getMessage());
-        }
+        // Aplicar blur horizontal e vertical
+        blurRegionWithKernel(image, region, kernel, radius, true);  // Horizontal
+        blurRegionWithKernel(image, region, kernel, radius, false); // Vertical
     }
 
-    private BufferedImage applyBoxBlur(BufferedImage image, int radius) {
-        int width = image.getWidth();
-        int height = image.getHeight();
-        BufferedImage result = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
+    private float[] createGaussianKernel(int radius) {
+        int size = radius * 2 + 1;
+        float[] kernel = new float[size];
+        float sigma = radius / 3.0f;
+        float sum = 0;
 
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                int red = 0, green = 0, blue = 0, count = 0;
+        for (int i = 0; i < size; i++) {
+            int x = i - radius;
+            kernel[i] = (float) Math.exp(-(x * x) / (2 * sigma * sigma));
+            sum += kernel[i];
+        }
 
-                // Calcular a média dos pixels na região do blur
-                for (int dy = -radius; dy <= radius; dy++) {
-                    for (int dx = -radius; dx <= radius; dx++) {
-                        int px = x + dx;
-                        int py = y + dy;
+        // Normalizar kernel
+        for (int i = 0; i < size; i++) {
+            kernel[i] /= sum;
+        }
 
-                        if (px >= 0 && px < width && py >= 0 && py < height) {
-                            Color color = new Color(image.getRGB(px, py));
-                            red += color.getRed();
-                            green += color.getGreen();
-                            blue += color.getBlue();
-                            count++;
-                        }
+        return kernel;
+    }
+
+    private void blurRegionWithKernel(BufferedImage image, Rectangle region, float[] kernel, int radius, boolean horizontal) {
+        BufferedImage temp = createImageCopy(image);
+
+        for (int y = region.y; y < region.y + region.height && y < image.getHeight(); y++) {
+            for (int x = region.x; x < region.x + region.width && x < image.getWidth(); x++) {
+
+                float red = 0, green = 0, blue = 0;
+
+                for (int i = 0; i < kernel.length; i++) {
+                    int offset = i - radius;
+                    int sampleX = horizontal ? Math.max(region.x, Math.min(region.x + region.width - 1, x + offset)) : x;
+                    int sampleY = horizontal ? y : Math.max(region.y, Math.min(region.y + region.height - 1, y + offset));
+
+                    if (sampleX >= 0 && sampleX < temp.getWidth() && sampleY >= 0 && sampleY < temp.getHeight()) {
+                        Color sampleColor = new Color(temp.getRGB(sampleX, sampleY));
+                        red += sampleColor.getRed() * kernel[i];
+                        green += sampleColor.getGreen() * kernel[i];
+                        blue += sampleColor.getBlue() * kernel[i];
                     }
                 }
 
-                if (count > 0) {
-                    red /= count;
-                    green /= count;
-                    blue /= count;
-                    result.setRGB(x, y, new Color(red, green, blue).getRGB());
+                Color blurredColor = new Color(
+                        Math.max(0, Math.min(255, (int) red)),
+                        Math.max(0, Math.min(255, (int) green)),
+                        Math.max(0, Math.min(255, (int) blue))
+                );
+
+                image.setRGB(x, y, blurredColor.getRGB());
+            }
+        }
+    }
+
+    private void applyPixelationEffect(BufferedImage image, Rectangle region) {
+        int pixelSize = Math.max(PIXELATION_SIZE, Math.min(region.width / 12, region.height / 5)); // Ajustado
+        System.out.println("[IMAGE-PROCESSOR] Aplicando pixelização com tamanho: " + pixelSize);
+
+        for (int y = region.y; y < region.y + region.height; y += pixelSize) {
+            for (int x = region.x; x < region.x + region.width; x += pixelSize) {
+
+                int endX = Math.min(x + pixelSize, Math.min(region.x + region.width, image.getWidth()));
+                int endY = Math.min(y + pixelSize, Math.min(region.y + region.height, image.getHeight()));
+
+                if (x < image.getWidth() && y < image.getHeight()) {
+                    Color avgColor = calculateAverageColor(image, x, y, endX, endY);
+
+                    // Preencher o bloco com a cor média
+                    Graphics2D g2d = image.createGraphics();
+                    g2d.setColor(avgColor);
+                    g2d.fillRect(x, y, endX - x, endY - y);
+                    g2d.dispose();
+                }
+            }
+        }
+    }
+
+    private Color calculateAverageColor(BufferedImage image, int startX, int startY, int endX, int endY) {
+        long totalRed = 0, totalGreen = 0, totalBlue = 0;
+        int pixelCount = 0;
+
+        for (int y = startY; y < endY; y++) {
+            for (int x = startX; x < endX; x++) {
+                if (x < image.getWidth() && y < image.getHeight()) {
+                    Color color = new Color(image.getRGB(x, y));
+                    totalRed += color.getRed();
+                    totalGreen += color.getGreen();
+                    totalBlue += color.getBlue();
+                    pixelCount++;
                 }
             }
         }
 
-        return result;
+        if (pixelCount == 0) return Color.GRAY;
+
+        return new Color(
+                (int) (totalRed / pixelCount),
+                (int) (totalGreen / pixelCount),
+                (int) (totalBlue / pixelCount)
+        );
     }
 
-    private byte[] compressBufferedImage(BufferedImage image) throws IOException {
+    private void addPrivacyIndicator(BufferedImage image, Rectangle region) {
+        Graphics2D g2d = image.createGraphics();
+
+        // Configurações de renderização
+        g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        g2d.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+
+        // Borda sutil - mais visível
+        g2d.setColor(new Color(255, 255, 255, 220)); // Mais opaca
+        g2d.setStroke(new BasicStroke(2.5f)); // Ligeiramente mais espessa
+        g2d.drawRect(region.x, region.y, region.width, region.height);
+
+        // Texto indicativo se região for grande o suficiente
+        if (region.width > 90 && region.height > 25) { // Threshold menor
+            addPrivacyText(g2d, region);
+        }
+
+        g2d.dispose();
+    }
+
+    private void addPrivacyText(Graphics2D g2d, Rectangle region) {
+        String text = "PRIVACIDADE";
+
+        // Calcular fonte baseada no tamanho da região
+        int fontSize = Math.max(9, Math.min(region.height / 3, region.width / 8)); // Ajustado
+        Font font = new Font("Arial", Font.BOLD, fontSize);
+        g2d.setFont(font);
+
+        FontMetrics fm = g2d.getFontMetrics();
+        int textWidth = fm.stringWidth(text);
+        int textHeight = fm.getAscent();
+
+        // Centralizar texto
+        int textX = region.x + (region.width - textWidth) / 2;
+        int textY = region.y + (region.height + textHeight) / 2;
+
+        // Verificar se cabe na região
+        if (textX > region.x && textY > region.y &&
+                textX + textWidth < region.x + region.width &&
+                textY < region.y + region.height) {
+
+            // Sombra do texto - mais escura
+            g2d.setColor(new Color(0, 0, 0, 180));
+            g2d.drawString(text, textX + 1, textY + 1);
+
+            // Texto principal
+            g2d.setColor(new Color(255, 255, 255, 240)); // Mais opaco
+            g2d.drawString(text, textX, textY);
+        }
+    }
+
+    private byte[] compressImageOptimized(BufferedImage image) throws IOException {
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
 
-        // Usar ImageWriter para controle de qualidade
-        Iterator<ImageWriter> writers = ImageIO.getImageWritersByFormatName("jpeg");
+        // Usar compressão JPEG com qualidade controlada
+        Iterator<ImageWriter> writers = ImageIO.getImageWritersByFormatName("jpg");
         if (!writers.hasNext()) {
-            throw new IOException("Nenhum writer JPEG encontrado");
+            throw new IOException("Nenhum escritor JPEG disponível");
         }
 
         ImageWriter writer = writers.next();
@@ -262,15 +509,71 @@ public class ImageProcessorService {
 
         if (param.canWriteCompressed()) {
             param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
-            param.setCompressionQuality((float) compressionQuality);
+            param.setCompressionQuality(COMPRESSION_QUALITY);
         }
 
         try (ImageOutputStream ios = ImageIO.createImageOutputStream(baos)) {
             writer.setOutput(ios);
             writer.write(null, new javax.imageio.IIOImage(image, null, null), param);
+        } finally {
             writer.dispose();
         }
 
-        return baos.toByteArray();
+        byte[] result = baos.toByteArray();
+        System.out.println("[IMAGE-PROCESSOR] Imagem comprimida: " + result.length + " bytes (qualidade: " +
+                (COMPRESSION_QUALITY * 100) + "%)");
+
+        return result;
+    }
+
+    // Métodos de cache e utilitários
+    public ProcessingResult getProcessingStatus(String processId) {
+        System.out.println("[IMAGE-PROCESSOR] Consultando status para " + processId);
+        ProcessingResult result = processingCache.get(processId);
+
+        if (result != null) {
+            System.out.println("[IMAGE-PROCESSOR] Status encontrado: " + result.getStatus());
+        } else {
+            System.out.println("[IMAGE-PROCESSOR] Status não encontrado para " + processId);
+        }
+
+        return result;
+    }
+
+    public void clearProcessingResult(String processId) {
+        System.out.println("[IMAGE-PROCESSOR] Limpando resultado para " + processId);
+        ProcessingResult removed = processingCache.remove(processId);
+        if (removed != null) {
+            System.out.println("[IMAGE-PROCESSOR] Resultado removido com sucesso");
+        } else {
+            System.out.println("[IMAGE-PROCESSOR] Nenhum resultado encontrado para remover");
+        }
+    }
+
+    public int getCacheSize() {
+        int size = processingCache.size();
+        System.out.println("[IMAGE-PROCESSOR] Tamanho atual do cache: " + size);
+        return size;
+    }
+
+    // Método para limpar cache antigo (opcional)
+    public void cleanupOldResults() {
+        System.out.println("[IMAGE-PROCESSOR] Executando limpeza de cache...");
+        int initialSize = processingCache.size();
+
+        // Aqui você pode implementar lógica para remover resultados antigos
+        // Por exemplo, baseado em timestamp dos ProcessingResult
+
+        int finalSize = processingCache.size();
+        System.out.println("[IMAGE-PROCESSOR] Cache limpo: " + initialSize + " -> " + finalSize + " entradas");
+    }
+
+    // Método para estatísticas (opcional)
+    public void logProcessingStatistics() {
+        System.out.println("[IMAGE-PROCESSOR] === Estatísticas de Processamento ===");
+        System.out.println("[IMAGE-PROCESSOR] Cache size: " + processingCache.size());
+        System.out.println("[IMAGE-PROCESSOR] Qualidade de compressão: " + (COMPRESSION_QUALITY * 100) + "%");
+        System.out.println("[IMAGE-PROCESSOR] Timeout configurado: " + PROCESSING_TIMEOUT_MS + "ms");
+        System.out.println("[IMAGE-PROCESSOR] ===================================");
     }
 }
